@@ -37,6 +37,14 @@ import {
   createPromptSchema,
 } from "@/lib/validation/listing";
 import { MarkdownContent } from "@/components/MarkdownContent";
+import {
+  forceSaveDraft,
+  parseDraft,
+  readDraft,
+  removeDraftIfCurrent,
+  saveDraftIfCurrent,
+  type DraftEnvelope,
+} from "@/util/draftConflict";
 
 const limits = {
   ...LISTING_LIMITS,
@@ -66,11 +74,73 @@ interface CreatePromptFormProps {
 
 const DRAFT_STORAGE_PREFIX = "prompt-hash:create-draft:";
 
+type DraftFormData = Pick<
+  FormData,
+  | "imageUrl"
+  | "title"
+  | "category"
+  | "previewText"
+  | "description"
+  | "priceXlm"
+  | "coCreators"
+>;
+
+const DRAFT_FIELDS: (keyof DraftFormData)[] = [
+  "imageUrl",
+  "title",
+  "category",
+  "previewText",
+  "description",
+  "priceXlm",
+  "coCreators",
+];
+
+const EMPTY_DRAFT_FORM_DATA: DraftFormData = {
+  imageUrl: "",
+  title: "",
+  category: "",
+  previewText: "",
+  description: "",
+  priceXlm: "2",
+  coCreators: [],
+};
+
+function toDraftFormData(data: Partial<FormData>): DraftFormData {
+  return {
+    imageUrl: data.imageUrl ?? "",
+    title: data.title ?? "",
+    category: data.category ?? "",
+    previewText: data.previewText ?? "",
+    description: data.description ?? "",
+    priceXlm: data.priceXlm ?? "2",
+    coCreators: data.coCreators ?? [],
+  };
+}
+
+function changedDraftFields(
+  local: DraftFormData,
+  remote: DraftFormData,
+): (keyof DraftFormData)[] {
+  return DRAFT_FIELDS.filter(
+    (field) => JSON.stringify(local[field]) !== JSON.stringify(remote[field]),
+  );
+}
+
+interface DraftConflictState {
+  local: DraftFormData;
+  remote: DraftEnvelope<DraftFormData> | null;
+  fields: (keyof DraftFormData)[];
+}
+
 export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
   const navigate = useNavigate();
   const { address, signTransaction } = useWallet();
   const draftStorageKey = address ? `${DRAFT_STORAGE_PREFIX}${address}` : null;
   const draftLoadRef = useRef<string | null>(null);
+  const draftRevisionRef = useRef<number | null>(null);
+  const draftWriterIdRef = useRef(
+    `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  );
   
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -83,13 +153,15 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
 
   const [draftCheckCompleted, setDraftCheckCompleted] = useState(false);
   const [hasDraftToRestore, setHasDraftToRestore] = useState(false);
-  const [draftData, setDraftData] = useState<any>(null);
+  const [draftData, setDraftData] = useState<DraftEnvelope<DraftFormData> | null>(null);
+  const [draftConflict, setDraftConflict] = useState<DraftConflictState | null>(null);
 
   const {
     register,
     handleSubmit,
     control,
     setValue,
+    getValues,
     watch,
     formState: { errors, isSubmitting },
   } = useForm<any>({
@@ -158,78 +230,144 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
     );
   };
 
-  // Load draft check on mount / storage key change
+  // Load the current revision before autosave can begin. Legacy snapshots are
+  // interpreted as revision zero by parseDraft/readDraft.
   useEffect(() => {
     setDraftCheckCompleted(false);
     setHasDraftToRestore(false);
     setDraftData(null);
+    setDraftConflict(null);
     setDraftRestored(false);
     setLastSavedAt(null);
+    draftRevisionRef.current = null;
 
     if (!draftStorageKey) {
+      setDraftCheckCompleted(true);
       return;
     }
 
-    const rawDraft = typeof window !== "undefined" && window.localStorage?.getItem
-      ? window.localStorage.getItem(draftStorageKey)
-      : null;
+    const storage =
+      typeof window !== "undefined" ? window.localStorage : null;
+    if (!storage) {
+      setDraftCheckCompleted(true);
+      return;
+    }
+
+    const rawDraft = storage.getItem(draftStorageKey);
+    const parsed = parseDraft<DraftFormData>(rawDraft);
+
+    if (parsed) {
+      draftRevisionRef.current = parsed.revision;
+      setDraftData(parsed);
+      setHasDraftToRestore(true);
+      return;
+    }
 
     if (rawDraft) {
-      try {
-        const parsed = JSON.parse(rawDraft);
-        if (parsed && parsed.formData) {
-          setDraftData(parsed);
-          setHasDraftToRestore(true);
-        } else {
-          setDraftCheckCompleted(true);
-        }
-      } catch {
-        if (typeof window !== "undefined" && window.localStorage?.removeItem) {
-          window.localStorage.removeItem(draftStorageKey);
-        }
-        setDraftCheckCompleted(true);
-      }
-    } else {
-      setDraftCheckCompleted(true);
+      storage.removeItem(draftStorageKey);
     }
+    setDraftCheckCompleted(true);
   }, [draftStorageKey]);
 
-  // Autosave effect with debounce
+  // Storage events are an early warning for edits made in another tab. The
+  // compare-before-write revision check below remains the authoritative guard.
   useEffect(() => {
-    if (!draftStorageKey || !draftCheckCompleted || hasDraftToRestore) {
+    if (!draftStorageKey || typeof window === "undefined") {
+      return;
+    }
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== draftStorageKey) {
+        return;
+      }
+
+      const remote = parseDraft<DraftFormData>(event.newValue);
+      if (remote?.writerId === draftWriterIdRef.current) {
+        return;
+      }
+
+      const remoteRevision = remote?.revision ?? null;
+      if (remoteRevision === draftRevisionRef.current) {
+        return;
+      }
+
+      const local = toDraftFormData(getValues() as Partial<FormData>);
+      setDraftConflict({
+        local,
+        remote,
+        fields: remote ? changedDraftFields(local, remote.formData) : DRAFT_FIELDS,
+      });
+    };
+
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [draftStorageKey, getValues]);
+
+  // Autosave uses optimistic concurrency: an older tab may only save when the
+  // storage revision still matches the revision it loaded.
+  useEffect(() => {
+    if (
+      !draftStorageKey ||
+      !draftCheckCompleted ||
+      hasDraftToRestore ||
+      draftConflict
+    ) {
       return;
     }
 
     const handler = setTimeout(() => {
-      const dataToSave = {
-        imageUrl: watchAllFields.imageUrl,
-        title: watchAllFields.title,
-        category: watchAllFields.category,
-        previewText: watchAllFields.previewText,
-        description: watchAllFields.description,
-        priceXlm: watchAllFields.priceXlm,
-        coCreators: watchAllFields.coCreators,
-      };
+      if (typeof window === "undefined") {
+        return;
+      }
+
+      const storage = window.localStorage;
+      const dataToSave = toDraftFormData(watchAllFields as Partial<FormData>);
 
       if (isFormEmpty(dataToSave)) {
-        if (typeof window !== "undefined" && window.localStorage?.removeItem) {
-          window.localStorage.removeItem(draftStorageKey);
+        const removed = removeDraftIfCurrent<DraftFormData>(
+          storage,
+          draftStorageKey,
+          draftRevisionRef.current,
+        );
+
+        if (removed.status === "conflict") {
+          setDraftConflict({
+            local: dataToSave,
+            remote: removed.current,
+            fields: removed.current
+              ? changedDraftFields(dataToSave, removed.current.formData)
+              : DRAFT_FIELDS,
+          });
+          return;
         }
+
+        draftRevisionRef.current = null;
         setLastSavedAt(null);
-      } else {
-        const savedAt = new Date().toISOString();
-        if (typeof window !== "undefined" && window.localStorage?.setItem) {
-          window.localStorage.setItem(
-            draftStorageKey,
-            JSON.stringify({
-              formData: dataToSave,
-              savedAt,
-            }),
-          );
-        }
-        setLastSavedAt(savedAt);
-        setDraftRestored(false);
+        return;
       }
+
+      const saved = saveDraftIfCurrent(
+        storage,
+        draftStorageKey,
+        dataToSave,
+        draftRevisionRef.current,
+        draftWriterIdRef.current,
+      );
+
+      if (saved.status === "conflict") {
+        setDraftConflict({
+          local: dataToSave,
+          remote: saved.current,
+          fields: saved.current
+            ? changedDraftFields(dataToSave, saved.current.formData)
+            : DRAFT_FIELDS,
+        });
+        return;
+      }
+
+      draftRevisionRef.current = saved.draft.revision;
+      setLastSavedAt(saved.draft.savedAt);
+      setDraftRestored(false);
     }, 1000);
 
     return () => clearTimeout(handler);
@@ -237,6 +375,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
     draftStorageKey,
     draftCheckCompleted,
     hasDraftToRestore,
+    draftConflict,
     watchAllFields.imageUrl,
     watchAllFields.title,
     watchAllFields.category,
@@ -246,51 +385,102 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
     JSON.stringify(watchAllFields.coCreators),
   ]);
 
-  const handleRestoreDraft = () => {
-    if (!draftData || !draftData.formData) return;
-
-    const fieldsToRestore = [
-      "imageUrl",
-      "title",
-      "category",
-      "previewText",
-      "description",
-      "priceXlm",
-      "coCreators",
-    ];
-
-    fieldsToRestore.forEach((key) => {
-      if (draftData.formData[key] !== undefined) {
-        setValue(key, draftData.formData[key]);
-      }
+  const applyDraftFormData = (data: DraftFormData) => {
+    DRAFT_FIELDS.forEach((field) => {
+      setValue(field, data[field] as never);
     });
+  };
 
+  const clearDraftForm = () => {
+    applyDraftFormData(EMPTY_DRAFT_FORM_DATA);
+    setValue("fullPrompt", "");
+  };
+
+  const handleRestoreDraft = () => {
+    if (!draftData) return;
+
+    applyDraftFormData(draftData.formData);
+    draftRevisionRef.current = draftData.revision;
     setDraftRestored(true);
-    setLastSavedAt(draftData.savedAt ?? null);
+    setLastSavedAt(draftData.savedAt || null);
     setHasDraftToRestore(false);
     setDraftCheckCompleted(true);
   };
 
   const handleDiscardDraft = () => {
-    if (draftStorageKey && typeof window !== "undefined" && window.localStorage?.removeItem) {
-      window.localStorage.removeItem(draftStorageKey);
+    if (draftStorageKey && typeof window !== "undefined") {
+      const removed = removeDraftIfCurrent<DraftFormData>(
+        window.localStorage,
+        draftStorageKey,
+        draftRevisionRef.current,
+      );
+
+      if (removed.status === "conflict") {
+        const local = toDraftFormData(getValues() as Partial<FormData>);
+        setDraftConflict({
+          local,
+          remote: removed.current,
+          fields: removed.current
+            ? changedDraftFields(local, removed.current.formData)
+            : DRAFT_FIELDS,
+        });
+        return;
+      }
+
+      draftRevisionRef.current = null;
     }
 
     if (draftRestored || hasDraftToRestore) {
-      setValue("imageUrl", "");
-      setValue("title", "");
-      setValue("category", "");
-      setValue("previewText", "");
-      setValue("description", "");
-      setValue("priceXlm", "2");
-      setValue("coCreators", []);
-      setValue("fullPrompt", "");
+      clearDraftForm();
     }
 
     setHasDraftToRestore(false);
     setDraftRestored(false);
     setLastSavedAt(null);
     setDraftData(null);
+    setDraftCheckCompleted(true);
+  };
+
+  const handleLoadRemoteDraft = () => {
+    if (!draftConflict) return;
+
+    if (draftConflict.remote) {
+      applyDraftFormData(draftConflict.remote.formData);
+      draftRevisionRef.current = draftConflict.remote.revision;
+      setLastSavedAt(draftConflict.remote.savedAt || null);
+      setDraftRestored(true);
+    } else {
+      clearDraftForm();
+      draftRevisionRef.current = null;
+      setLastSavedAt(null);
+      setDraftRestored(false);
+    }
+
+    setDraftData(draftConflict.remote);
+    setHasDraftToRestore(false);
+    setDraftConflict(null);
+    setDraftCheckCompleted(true);
+  };
+
+  const handleKeepLocalDraft = () => {
+    if (!draftConflict || !draftStorageKey || typeof window === "undefined") {
+      return;
+    }
+
+    const local = toDraftFormData(getValues() as Partial<FormData>);
+    const saved = forceSaveDraft(
+      window.localStorage,
+      draftStorageKey,
+      local,
+      draftWriterIdRef.current,
+    );
+
+    draftRevisionRef.current = saved.revision;
+    setDraftData(saved);
+    setLastSavedAt(saved.savedAt);
+    setDraftRestored(false);
+    setHasDraftToRestore(false);
+    setDraftConflict(null);
     setDraftCheckCompleted(true);
   };
 
@@ -336,8 +526,15 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
         },
       );
 
-      if (draftStorageKey && typeof window !== "undefined" && window.localStorage?.removeItem) {
-        window.localStorage.removeItem(draftStorageKey);
+      if (draftStorageKey && typeof window !== "undefined") {
+        const removed = removeDraftIfCurrent<DraftFormData>(
+          window.localStorage,
+          draftStorageKey,
+          draftRevisionRef.current,
+        );
+        if (removed.status === "removed") {
+          draftRevisionRef.current = null;
+        }
       }
 
       setSuccessMessage(`Prompt #${result.promptId.toString()} created successfully.`);
@@ -364,6 +561,49 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
         {!isConfigured && (
           <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-100 mb-4">
             Connect your wallet and configure `PUBLIC_PROMPT_HASH_CONTRACT_ID` plus `PUBLIC_UNLOCK_PUBLIC_KEY` before listing prompts.
+          </div>
+        )}
+
+        {draftConflict && isConfigured && (
+          <div
+            role="alert"
+            className="mb-4 rounded-2xl border border-amber-400/30 bg-amber-500/10 p-4 text-sm text-amber-100"
+          >
+            <div className="flex items-start gap-2">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold">Draft conflict detected — autosave paused</p>
+                <p className="mt-1 text-xs text-amber-100/80">
+                  {draftConflict.remote
+                    ? `Another tab saved revision ${draftConflict.remote.revision}${draftConflict.remote.savedAt ? ` at ${new Date(draftConflict.remote.savedAt).toLocaleString()}` : ""}. Choose which version to keep.`
+                    : "Another tab removed this saved draft. Choose whether to accept that removal or keep your current edits."}
+                </p>
+                {draftConflict.fields.length > 0 && (
+                  <p className="mt-1 text-xs text-amber-100/70">
+                    Changed fields: {draftConflict.fields.join(", ")}
+                  </p>
+                )}
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="border-amber-300/40 bg-transparent text-amber-100 hover:bg-amber-400/10 hover:text-white"
+                    onClick={handleLoadRemoteDraft}
+                  >
+                    {draftConflict.remote ? "Load newer draft" : "Accept removal"}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="bg-amber-300 text-slate-950 hover:bg-amber-200"
+                    onClick={handleKeepLocalDraft}
+                  >
+                    Keep my edits
+                  </Button>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
