@@ -38,12 +38,15 @@ import {
 } from "@/lib/validation/listing";
 import { MarkdownContent } from "@/components/MarkdownContent";
 import {
+  draftVersion,
   forceSaveDraft,
   parseDraft,
   readDraft,
   removeDraftIfCurrent,
+  sameDraftVersion,
   saveDraftIfCurrent,
   type DraftEnvelope,
+  type DraftVersion,
 } from "@/util/draftConflict";
 
 const limits = {
@@ -137,7 +140,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
   const { address, signTransaction } = useWallet();
   const draftStorageKey = address ? `${DRAFT_STORAGE_PREFIX}${address}` : null;
   const draftLoadRef = useRef<string | null>(null);
-  const draftRevisionRef = useRef<number | null>(null);
+  const draftVersionRef = useRef<DraftVersion | null>(null);
   const draftWriterIdRef = useRef(
     `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`,
   );
@@ -230,8 +233,8 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
     );
   };
 
-  // Load the current revision before autosave can begin. Legacy snapshots are
-  // interpreted as revision zero by parseDraft/readDraft.
+  // Load the current version token before autosave can begin. Legacy snapshots
+  // are interpreted as revision zero by parseDraft/readDraft.
   useEffect(() => {
     setDraftCheckCompleted(false);
     setHasDraftToRestore(false);
@@ -239,7 +242,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
     setDraftConflict(null);
     setDraftRestored(false);
     setLastSavedAt(null);
-    draftRevisionRef.current = null;
+    draftVersionRef.current = null;
 
     if (!draftStorageKey) {
       setDraftCheckCompleted(true);
@@ -257,7 +260,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
     const parsed = parseDraft<DraftFormData>(rawDraft);
 
     if (parsed) {
-      draftRevisionRef.current = parsed.revision;
+      draftVersionRef.current = draftVersion(parsed);
       setDraftData(parsed);
       setHasDraftToRestore(true);
       return;
@@ -270,7 +273,9 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
   }, [draftStorageKey]);
 
   // Storage events are an early warning for edits made in another tab. The
-  // compare-before-write revision check below remains the authoritative guard.
+  // compare-before-write check on the full version token (revision + writerId)
+  // below remains the authoritative guard; numeric revision alone can match a
+  // same-revision snapshot written by another tab.
   useEffect(() => {
     if (!draftStorageKey || typeof window === "undefined") {
       return;
@@ -286,8 +291,8 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
         return;
       }
 
-      const remoteRevision = remote?.revision ?? null;
-      if (remoteRevision === draftRevisionRef.current) {
+      const remoteVersion = draftVersion(remote);
+      if (sameDraftVersion(remoteVersion, draftVersionRef.current)) {
         return;
       }
 
@@ -304,7 +309,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
   }, [draftStorageKey, getValues]);
 
   // Autosave uses optimistic concurrency: an older tab may only save when the
-  // storage revision still matches the revision it loaded.
+  // stored version token still matches the version token it loaded.
   useEffect(() => {
     if (
       !draftStorageKey ||
@@ -327,7 +332,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
         const removed = removeDraftIfCurrent<DraftFormData>(
           storage,
           draftStorageKey,
-          draftRevisionRef.current,
+          draftVersionRef.current,
         );
 
         if (removed.status === "conflict") {
@@ -341,7 +346,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
           return;
         }
 
-        draftRevisionRef.current = null;
+        draftVersionRef.current = null;
         setLastSavedAt(null);
         return;
       }
@@ -350,7 +355,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
         storage,
         draftStorageKey,
         dataToSave,
-        draftRevisionRef.current,
+        draftVersionRef.current,
         draftWriterIdRef.current,
       );
 
@@ -365,7 +370,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
         return;
       }
 
-      draftRevisionRef.current = saved.draft.revision;
+      draftVersionRef.current = draftVersion(saved.draft);
       setLastSavedAt(saved.draft.savedAt);
       setDraftRestored(false);
     }, 1000);
@@ -400,7 +405,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
     if (!draftData) return;
 
     applyDraftFormData(draftData.formData);
-    draftRevisionRef.current = draftData.revision;
+    draftVersionRef.current = draftVersion(draftData);
     setDraftRestored(true);
     setLastSavedAt(draftData.savedAt || null);
     setHasDraftToRestore(false);
@@ -412,7 +417,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
       const removed = removeDraftIfCurrent<DraftFormData>(
         window.localStorage,
         draftStorageKey,
-        draftRevisionRef.current,
+        draftVersionRef.current,
       );
 
       if (removed.status === "conflict") {
@@ -427,7 +432,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
         return;
       }
 
-      draftRevisionRef.current = null;
+      draftVersionRef.current = null;
     }
 
     if (draftRestored || hasDraftToRestore) {
@@ -446,12 +451,12 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
 
     if (draftConflict.remote) {
       applyDraftFormData(draftConflict.remote.formData);
-      draftRevisionRef.current = draftConflict.remote.revision;
+      draftVersionRef.current = draftVersion(draftConflict.remote);
       setLastSavedAt(draftConflict.remote.savedAt || null);
       setDraftRestored(true);
     } else {
       clearDraftForm();
-      draftRevisionRef.current = null;
+      draftVersionRef.current = null;
       setLastSavedAt(null);
       setDraftRestored(false);
     }
@@ -475,7 +480,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
       draftWriterIdRef.current,
     );
 
-    draftRevisionRef.current = saved.revision;
+    draftVersionRef.current = draftVersion(saved);
     setDraftData(saved);
     setLastSavedAt(saved.savedAt);
     setDraftRestored(false);
@@ -530,10 +535,10 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
         const removed = removeDraftIfCurrent<DraftFormData>(
           window.localStorage,
           draftStorageKey,
-          draftRevisionRef.current,
+          draftVersionRef.current,
         );
         if (removed.status === "removed") {
-          draftRevisionRef.current = null;
+          draftVersionRef.current = null;
         }
       }
 
@@ -591,7 +596,7 @@ export function CreatePromptForm({ onCreated }: CreatePromptFormProps) {
                     className="border-amber-300/40 bg-transparent text-amber-100 hover:bg-amber-400/10 hover:text-white"
                     onClick={handleLoadRemoteDraft}
                   >
-                    {draftConflict.remote ? "Load newer draft" : "Accept removal"}
+                    {draftConflict.remote ? "Load other draft" : "Accept removal"}
                   </Button>
                   <Button
                     type="button"

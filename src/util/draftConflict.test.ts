@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  draftVersion,
   forceSaveDraft,
   parseDraft,
   readDraft,
+  removeDraftIfCurrent,
   saveDraftIfCurrent,
   type StorageLike,
 } from "./draftConflict";
@@ -38,13 +40,13 @@ describe("versioned draft conflict handling", () => {
     );
     expect(first.status).toBe("saved");
 
-    const tabBRevision = readDraft<{ title: string }>(storage, key)!.revision;
+    const tabBVersion = draftVersion(readDraft<{ title: string }>(storage, key));
 
     const second = saveDraftIfCurrent(
       storage,
       key,
       { title: "tab-a v2" },
-      tabBRevision,
+      tabBVersion,
       "tab-a",
       () => "2026-09-20T20:01:00.000Z",
     );
@@ -54,7 +56,7 @@ describe("versioned draft conflict handling", () => {
       storage,
       key,
       { title: "tab-b stale" },
-      tabBRevision,
+      tabBVersion,
       "tab-b",
       () => "2026-09-20T20:02:00.000Z",
     );
@@ -62,6 +64,47 @@ describe("versioned draft conflict handling", () => {
     expect(staleWrite.status).toBe("conflict");
     expect(readDraft<{ title: string }>(storage, key)?.formData.title).toBe(
       "tab-a v2",
+    );
+  });
+
+  it("rejects same-revision snapshots written by a different tab", () => {
+    const storage = new MemoryStorage();
+    const key = "draft";
+
+    storage.setItem(
+      key,
+      JSON.stringify({
+        formData: { title: "tab-a" },
+        savedAt: "2026-09-20T20:02:30.000Z",
+        revision: 2,
+        writerId: "tab-a",
+      }),
+    );
+
+    const staleVersion = { revision: 2, writerId: "tab-b" };
+    const staleWrite = saveDraftIfCurrent(
+      storage,
+      key,
+      { title: "tab-b stale" },
+      staleVersion,
+      "tab-b",
+    );
+    const staleRemove = removeDraftIfCurrent<{ title: string }>(
+      storage,
+      key,
+      staleVersion,
+    );
+
+    expect(staleWrite).toMatchObject({
+      status: "conflict",
+      current: { revision: 2, writerId: "tab-a" },
+    });
+    expect(staleRemove).toMatchObject({
+      status: "conflict",
+      current: { revision: 2, writerId: "tab-a" },
+    });
+    expect(readDraft<{ title: string }>(storage, key)?.formData.title).toBe(
+      "tab-a",
     );
   });
 

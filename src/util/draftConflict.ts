@@ -5,6 +5,26 @@ export type DraftEnvelope<T> = {
   writerId: string;
 };
 
+export type DraftVersion = Pick<DraftEnvelope<unknown>, "revision" | "writerId">;
+
+export function draftVersion<T>(
+  draft: DraftEnvelope<T> | null,
+): DraftVersion | null {
+  return draft
+    ? { revision: draft.revision, writerId: draft.writerId }
+    : null;
+}
+
+export function sameDraftVersion(
+  left: DraftVersion | null,
+  right: DraftVersion | null,
+): boolean {
+  if (left === null || right === null) {
+    return left === right;
+  }
+  return left.revision === right.revision && left.writerId === right.writerId;
+}
+
 export type StorageLike = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 export type DraftSaveResult<T> =
@@ -49,14 +69,14 @@ export function saveDraftIfCurrent<T>(
   storage: StorageLike,
   key: string,
   formData: T,
-  expectedRevision: number | null,
+  expectedVersion: DraftVersion | null,
   writerId: string,
   now: () => string = () => new Date().toISOString(),
 ): DraftSaveResult<T> {
   const current = readDraft<T>(storage, key);
-  const actualRevision = current?.revision ?? null;
+  const actualVersion = draftVersion(current);
 
-  if (actualRevision !== expectedRevision) {
+  if (!sameDraftVersion(actualVersion, expectedVersion)) {
     return { status: "conflict", current };
   }
 
@@ -91,12 +111,12 @@ export function forceSaveDraft<T>(
 export function removeDraftIfCurrent<T>(
   storage: StorageLike,
   key: string,
-  expectedRevision: number | null,
+  expectedVersion: DraftVersion | null,
 ): DraftRemoveResult<T> {
   const current = readDraft<T>(storage, key);
-  const actualRevision = current?.revision ?? null;
+  const actualVersion = draftVersion(current);
 
-  if (actualRevision !== expectedRevision) {
+  if (!sameDraftVersion(actualVersion, expectedVersion)) {
     return { status: "conflict", current };
   }
 
